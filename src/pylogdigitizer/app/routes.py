@@ -222,7 +222,8 @@ def color_header_rows(H: dict) -> list:
 
 # ---------------------------------------------------------------- curves (one session per identified curve)
 class MaskPyramid(TilePyramid):
-    """DZI tiles of one curve's ink as a transparent dark layer (the highlight layer: dark grey on the\n    greyscale scan, so it stands out without competing with the coloured traces)."""
+    """DZI tiles of one curve's ink as a transparent dark layer (the highlight layer: dark grey on the
+    greyscale scan, so it stands out without competing with the coloured traces)."""
 
     def __init__(self, mask: np.ndarray, rgb=(17, 17, 17), tile_size: int = 512):
         import cv2
@@ -425,7 +426,8 @@ def install(app, root: Path, runner) -> None:
         st.update(depth_sections=e.base.depth_sections, depth_section=e.base.depth_section, rotate=e.app.get("rotate", 0.0),
                   active=getattr(e, "active", None), kind=(getattr(e, "ident", None) or {}).get("kind", "single"),
                   n_curves=len(getattr(e, "curves", [])), scan_name=e.app.get("scan_stem"), las=e.base.las_path and _display_path(e.base.las_path, root),
-                  skew=[float(a) for a in e.base.L.skew_deg] if e.base.L is not None else [])
+                  skew=[float(a) for a in e.base.L.skew_deg] if e.base.L is not None else [],
+                  rectification=e.app.get("rectification"))
         inp = e.app.get("input") or {}
         st.update(input=dict(kind=inp.get("kind"), used=inp.get("used", "scan"), method=inp.get("method", "auto"),
                              page=inp.get("page", 0), n_pages=inp.get("n_pages", 1),
@@ -725,6 +727,103 @@ def install(app, root: Path, runner) -> None:
             sessions[sid] = n
             return dict(sid=sid, rotate=deg)
         return job(e, "Rotate", work)
+
+    # ---------------- crooked raster rectification (angled/curved depth lines + track edge guides)
+    def _rectified_copy(src_path: Path, cal_dict: dict) -> tuple[Path, dict, dict]:
+        """Warp ``src_path`` (RGB if color, else deskewed ink/gray) to a temporary TIFF and return
+        ``(tif_path, lattice_dict, clean_cal_dict)``."""
+        from PIL import Image
+        from pylogdigitizer.scan_io import is_color_scan, load_rgb
+        from pylogdigitizer.raster_rectify import RasterCalibration, rectify_any
+
+        is_col = is_color_scan(src_path)
+        raw = load_rgb(src_path) if is_col else load_ink(src_path)
+        h, w = raw.shape[:2]
+        cal_payload = dict(cal_dict)
+        cal_payload["sheet_shape"] = [int(h), int(w)]
+        cal = RasterCalibration.from_dict(cal_payload)
+        lat = cal.build_lattice()
+        rect_img = rectify_any(raw, lat, out_shape=lat.shape)
+        if rect_img.dtype == bool:
+            out_u8 = np.where(rect_img, 0, 255).astype(np.uint8)
+        else:
+            out_u8 = rect_img.astype(np.uint8)
+        d = Path(tempfile.mkdtemp(prefix="rectified_", dir=run_dir))
+        q = d / (src_path.stem + "_rect.tif")
+        Image.fromarray(out_u8).save(q)
+        lat_dict = dict(
+            X=lat.X.tolist(),
+            Y=lat.Y.tolist(),
+            u=lat.u.tolist(),
+            v=lat.v.tolist(),
+            shape=list(lat.shape),
+        )
+        return q, lat_dict, cal.to_dict()
+
+    @app.post("/app/api/{sid}/rectify/follow")
+    def rectify_follow(sid: str, body: dict = Body(...)):
+        """{p_start: [x0, y0], p_end: [x1, y1], step_px?, search_px?, line_len?}: trace a crooked
+        vertical track boundary between two sheet points while bridging across crossing curves."""
+        from pylogdigitizer.raster_rectify import follow_vertical_boundary
+        e = get(sid)
+        p0 = body.get("p_start") or []
+        p1 = body.get("p_end") or []
+        if len(p0) != 2 or len(p1) != 2:
+            raise HTTPException(400, "p_start and p_end must each be [x, y]")
+        pts = locked(e, lambda s: follow_vertical_boundary(
+            e.base.ink,
+            (float(p0[0]), float(p0[1])),
+            (float(p1[0]), float(p1[1])),
+            step_px=int(body.get("step_px", 40)),
+            search_px=int(body.get("search_px", 12)),
+            line_len=int(body.get("line_len", 45)),
+        ))
+        return _clean(dict(points=[[float(x), float(y)] for x, y in pts]))
+
+    @app.post("/app/api/{sid}/rectify/apply")
+    def rectify_apply(sid: str, body: dict = Body(...)):
+        """Apply a RasterCalibration {tie_lines, tracks, px_per_ft?}, warp the scan into a
+        flattened TIFF, re-run analysis on the flattened sheet, and record the calibration."""
+        e = get(sid)
+        b = dict(e.app["body"])
+        scan = resolve(b.get("scan"))
+        if scan is None:
+            raise HTTPException(400, "no scan associated with session")
+        cal_in = body.get("calibration") if isinstance(body.get("calibration"), dict) else body
+
+        def work(j):
+            j.progress(0, 2, "warping scan from depth tie-lines and track boundaries")
+            rect_tif, lat_dict, cal_clean = _rectified_copy(scan, cal_in)
+            j.progress(1, 2, "re-analyzing tracks, depth labels, headers and curves on flattened scan")
+            n = build_entry(rect_tif, e.base.las_path, b, j, sid=sid, rotate=float(e.app.get("rotate", 0.0)))
+            n.app["rectification"] = dict(calibration=cal_clean, lattice=lat_dict, rectified_scan=str(rect_tif))
+            sessions[sid] = n
+            return dict(sid=sid, rectified_scan=str(rect_tif), n_curves=len(n.curves))
+
+        return job(e, "Rectify crooked scan", work)
+
+    @app.post("/app/api/{sid}/export/rectify_training")
+    def export_rectify_training(sid: str, body: dict = Body(default={})):
+        """Save paired raw scan, flattened scan, 2-D lattice, and calibration JSON under
+        training_data/rectification/ for ML training."""
+        from pylogdigitizer.raster_rectify import RasterCalibration, save_rectification_sample
+        from pylogdigitizer.scan_io import is_color_scan, load_rgb
+
+        e = get(sid)
+        rect_info = e.app.get("rectification") or {}
+        cal_dict = body.get("calibration") or rect_info.get("calibration")
+        if not cal_dict:
+            raise HTTPException(400, "no rectification calibration available to save as training sample")
+        scan = resolve(e.app["body"].get("scan"))
+        if scan is None:
+            raise HTTPException(400, "no source scan found")
+        raw = load_rgb(scan) if is_color_scan(scan) else load_ink(scan)
+        cal = RasterCalibration.from_dict(cal_dict)
+        sample_id = safe_name(body.get("sample_id") or f"{e.base.well}_{Path(scan.stem).name}_{sid}", "sample")
+        meta = dict(well=e.base.well, scan=scan.name, curve=e.app.get("curve"), n_curves=len(e.curves))
+        out_dir = root / "training_data" / "rectification"
+        p = locked(e, lambda s: save_rectification_sample(out_dir, sample_id, raw, cal, meta=meta))
+        return _clean(dict(sample_dir=str(p.relative_to(root)), sample_id=sample_id))
 
     # ---------------- curves: list, select, edit the side panel, layers
     @app.get("/app/api/{sid}/curves")
