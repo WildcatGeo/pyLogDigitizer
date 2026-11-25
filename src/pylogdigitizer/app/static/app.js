@@ -115,7 +115,7 @@ function draw() {
         c.strokeStyle = LBLsel.has(i) ? "#2563eb" : "#d62728"; c.lineWidth = 3; c.beginPath(); c.moveTo(a.x, a.y); c.lineTo(b.x, b.y); c.stroke();
         if (STEP === "tracks") { c.fillStyle = l.value == null ? "#d97706" : "#b91c1c"; c.font = "bold 13px -apple-system,sans-serif"; c.fillText(l.value == null ? "?" : l.value + " ft", b.x + 6, b.y + 4); } });
     }
-    drawRectGuides(c, P, vis);
+    if (STEP === "tracks") drawRectGuides(c, P, vis);
   }
   if (STEP === "curves" && HDR && LAYERS.grid) drawWords(c, P);
   if (LAYERS.traces && TR) {                                              // traced curves layer: every curve in its colour
@@ -214,8 +214,9 @@ window.addEventListener("resize", draw);
 
 // ------------------------------------------------------------------ crooked scan rectification (Step 2)
 let RECT_CAL = {tie_lines: [], tracks: [], px_per_ft: null};
-let RECT_CUR_LINE = null;   // {depth, nodes:[[x,y],..], is_gap:false, synthetic:false} while placing a 2-point angled line
+let RECT_CUR_LINE = null;   // {depth, nodes:[[x,y],..], is_gap:false, synthetic:false} while placing an angled/curved line
 let RECT_EDGE_PT = null;    // [x, y] first click when auto-following a vertical track boundary
+let RECT_DRAG = null;       // {kind:"tie"|"edge", tIdx, nIdx, side?, moved:false, t:0}
 
 function rectInitFromSession() {
   const saved = ST?.rectification?.calibration;
@@ -307,10 +308,32 @@ function rectShiftLine(idx, dy, dAngDeg) {
   renderRectPanel(); draw();
 }
 
+function rectNodeNear(ev) {
+  if (!viewer || !BASE() || !["tieline", "edgeguide"].includes(mode)) return null;
+  const ip = imgPt(ev), z = BASE().viewportToImageZoom(viewer.viewport.getZoom(true)), tol = 12 / z;
+  for (let tIdx = 0; tIdx < (RECT_CAL.tie_lines || []).length; tIdx++) {
+    const nodes = RECT_CAL.tie_lines[tIdx].nodes || [];
+    for (let nIdx = 0; nIdx < nodes.length; nIdx++) {
+      const [nx, ny] = nodes[nIdx];
+      if (Math.hypot(nx - ip.x, ny - ip.y) < tol) return {kind: "tie", tIdx, nIdx};
+    }
+  }
+  for (let tIdx = 0; tIdx < (RECT_CAL.tracks || []).length; tIdx++) {
+    const tr = RECT_CAL.tracks[tIdx];
+    for (const side of ["left_nodes", "right_nodes"]) {
+      const nodes = tr[side] || [];
+      for (let nIdx = 0; nIdx < nodes.length; nIdx++) {
+        const [nx, ny] = nodes[nIdx];
+        if (Math.hypot(nx - ip.x, ny - ip.y) < tol) return {kind: "edge", tIdx, side, nIdx};
+      }
+    }
+  }
+  return null;
+}
+
 function drawRectGuides(c, P, vis) {
   if (!["tieline", "edgeguide"].includes(mode)) return;
-  // Angled / curved depth tie-lines
-  (RECT_CAL.tie_lines || []).forEach((ln, idx) => {
+  (RECT_CAL.tie_lines || []).forEach((ln, tIdx) => {
     const ys = ln.nodes.map(p => p[1]);
     if (!ys.some(vis)) return;
     c.save();
@@ -323,30 +346,36 @@ function drawRectGuides(c, P, vis) {
     const p0 = P(ln.nodes[0][0], ln.nodes[0][1]);
     c.fillStyle = c.strokeStyle; c.font = "bold 12px -apple-system,sans-serif";
     c.fillText(`${ln.depth} ft${ln.is_gap ? " [GAP]" : ""}`, p0.x + 6, p0.y - 5);
-    for (const [x, y] of ln.nodes) {
-      const q = P(x, y); c.fillStyle = "#fff"; c.beginPath(); c.arc(q.x, q.y, 5, 0, 7); c.fill();
+    ln.nodes.forEach(([x, y], nIdx) => {
+      const activePt = RECT_DRAG && RECT_DRAG.kind === "tie" && RECT_DRAG.tIdx === tIdx && RECT_DRAG.nIdx === nIdx;
+      const q = P(x, y); c.fillStyle = activePt ? "#f59e0b" : "#fff";
+      c.beginPath(); c.arc(q.x, q.y, 5.5, 0, 7); c.fill();
       c.strokeStyle = "#2563eb"; c.lineWidth = 2; c.stroke();
-    }
+    });
     c.restore();
   });
   if (RECT_CUR_LINE) {
-    const p = P(RECT_CUR_LINE.nodes[0][0], RECT_CUR_LINE.nodes[0][1]);
-    c.fillStyle = "#2563eb"; c.beginPath(); c.arc(p.x, p.y, 6, 0, 7); c.fill();
+    c.save();
+    c.strokeStyle = "#2563eb"; c.lineWidth = 2; c.setLineDash([4, 3]);
+    c.beginPath();
+    RECT_CUR_LINE.nodes.forEach(([x, y], i) => { const p = P(x, y); i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y); });
+    c.stroke(); c.restore();
   }
-  // Multi-track left/right boundary polylines
-  (RECT_CAL.tracks || []).forEach(tr => {
-    for (const [side, nodes] of [["L", tr.left_nodes || []], ["R", tr.right_nodes || []]]) {
+  (RECT_CAL.tracks || []).forEach((tr, tIdx) => {
+    for (const [side, key, col] of [["L", "left_nodes", "#0891b2"], ["R", "right_nodes", "#7c3aed"]]) {
+      const nodes = tr[key] || [];
       if (!nodes.length) continue;
       c.save();
-      c.strokeStyle = side === "L" ? "#0891b2" : "#7c3aed";
-      c.lineWidth = 2.5;
+      c.strokeStyle = col; c.lineWidth = 2.5;
       c.beginPath();
       nodes.forEach(([x, y], i) => { const p = P(x, y); i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y); });
       c.stroke();
-      for (const [x, y] of nodes) {
-        if (!vis(y)) continue;
-        const q = P(x, y); c.fillStyle = c.strokeStyle; c.beginPath(); c.arc(q.x, q.y, 4.5, 0, 7); c.fill();
-      }
+      nodes.forEach(([x, y], nIdx) => {
+        if (!vis(y)) return;
+        const activePt = RECT_DRAG && RECT_DRAG.kind === "edge" && RECT_DRAG.tIdx === tIdx && RECT_DRAG.side === key && RECT_DRAG.nIdx === nIdx;
+        const q = P(x, y); c.fillStyle = activePt ? "#f59e0b" : col;
+        c.beginPath(); c.arc(q.x, q.y, 5, 0, 7); c.fill();
+      });
       c.restore();
     }
   });
@@ -393,7 +422,7 @@ function renderRectPanel() {
       <button id="rectApplyBtn" class="primary">Flatten &amp; re-analyze</button>
       <button id="rectSaveTrainBtn">Save warp sample</button>
     </div>
-    <div class="note"><b>T</b>: click two points (or add bends) for an angled depth line. <b>G</b>: click top &amp; bottom of a track edge to trace across curves.</div>
+    <div class="note"><b>T</b>: click points (2+ for angled/curved depth line). <b>G</b>: click top &amp; bottom to trace edge across curves. Drag nodes to reshape.</div>
   `;
   $("rectLineSel")?.addEventListener("change", () => {
     const idx = +$("rectLineSel").value || 0;
@@ -486,7 +515,7 @@ async function handleRectClick(row, x) {
 function bindRectifyTools() {
   document.querySelectorAll("button.tool[data-mode='tieline'], button.tool[data-mode='edgeguide']").forEach(b => {
     b.onclick = () => {
-      RECT_CUR_LINE = null; RECT_EDGE_PT = null;
+      RECT_CUR_LINE = null; RECT_EDGE_PT = null; RECT_DRAG = null;
       setMode(mode === b.dataset.mode ? "pan" : b.dataset.mode);
     };
   });
@@ -501,6 +530,7 @@ async function onClick(ev) {
       const t = prompt(`OCR read "${w.ocr_text || w.text}" (confidence ${Math.round(w.conf)}). Correct text (empty = delete):`, w.text); if (t === null || t === w.text) return;
       HDR = Object.assign(HDR || {}, await api("POST", A("/header/words"), {track: w.track, edits: [{i: w.i, text: t}]}));
       HW = (await api("GET", A("/header/words"))).words; draw(); return; }
+    if (STEP === "tracks" && (Date.now() - (RECT_DRAG?.t || 0) < 300)) return;
     if (STEP === "tracks" && await handleRectClick(row, x)) return;
     if (mode === "circle") { await fixCall("/fix/circle", {row, x, radius: +($("circR")?.value || 60), through: ev.originalEvent?.shiftKey || false}); return; }
     if (mode === "fix") { if (Date.now() - (DRAG?.t || 0) < 300) return; await fixCall("/fix/pin", {row, x}); return; }
@@ -524,16 +554,45 @@ const imgPt = ev => BASE().viewerElementToImageCoordinates(ev.position);
 function pinNear(ev) { const ip = imgPt(ev), z = BASE().viewportToImageZoom(viewer.viewport.getZoom(true)), tol = 12 / z;
   return (OV?.anchors || []).findIndex(a => Math.hypot(a[1] - ip.x, a[0] - ip.y) < tol); }
 function onPress(ev) {
+  if (STEP === "tracks") {
+    const rn = rectNodeNear(ev);
+    if (rn) { RECT_DRAG = Object.assign(rn, {moved: false, t: 0}); viewer.setMouseNavEnabled(false); ev.preventDefaultAction = true; return; }
+  }
   if (mode === "guide") { const ip = imgPt(ev); STROKE = [[ip.y, ip.x]]; ev.preventDefaultAction = true; return; }
   if (mode === "node") { const ip = imgPt(ev); NODE = {row: ip.y, x: ip.x}; viewer.setMouseNavEnabled(false); ev.preventDefaultAction = true; return; }
   if (mode === "fix") { const i = pinNear(ev); if (i >= 0) { const ip = imgPt(ev); DRAG = {i, row: ip.y, x: ip.x, moved: false}; viewer.setMouseNavEnabled(false); } }
 }
 function onDrag(ev) {
+  if (RECT_DRAG && RECT_DRAG.t === 0) {
+    const ip = imgPt(ev);
+    if (RECT_DRAG.kind === "tie") {
+      RECT_CAL.tie_lines[RECT_DRAG.tIdx].nodes[RECT_DRAG.nIdx] = [ip.x, ip.y];
+    } else if (RECT_DRAG.kind === "edge") {
+      RECT_CAL.tracks[RECT_DRAG.tIdx][RECT_DRAG.side][RECT_DRAG.nIdx] = [ip.x, ip.y];
+    }
+    RECT_DRAG.moved = true; ev.preventDefaultAction = true; drawSoon(); return;
+  }
   if (mode === "guide" && STROKE.length) { const ip = imgPt(ev); STROKE.push([ip.y, ip.x]); ev.preventDefaultAction = true; drawSoon(); return; }
   if (mode === "node" && NODE) { const ip = imgPt(ev); NODE = {row: ip.y, x: ip.x}; HOVER = NODE; ev.preventDefaultAction = true; drawSoon(); return; }
   if (DRAG) { const ip = imgPt(ev); DRAG.row = ip.y; DRAG.x = ip.x; DRAG.moved = true; ev.preventDefaultAction = true; drawSoon(); }
 }
 async function onRelease() {
+  if (RECT_DRAG && RECT_DRAG.t === 0) {
+    const wasMoved = RECT_DRAG.moved;
+    RECT_DRAG = {t: Date.now()};
+    viewer.setMouseNavEnabled(true);
+    if (wasMoved) {
+      RECT_CAL.tie_lines.forEach(ln => ln.nodes.sort((a, b) => a[0] - b[0]));
+      RECT_CAL.tie_lines.sort((a, b) => a.depth - b.depth);
+      RECT_CAL.tracks.forEach(tr => {
+        tr.left_nodes.sort((a, b) => a[1] - b[1]);
+        tr.right_nodes.sort((a, b) => a[1] - b[1]);
+      });
+      renderRectPanel();
+    }
+    draw();
+    return;
+  }
   if (mode === "node" && NODE) { const n = NODE; NODE = null; viewer.setMouseNavEnabled(true);
     try { await fixCall("/fix/node", {row: n.row, x: n.x, radius: +($("circR")?.value || 60)}); } catch (e) { draw(); } return; }
   if (mode === "guide" && STROKE.length) { const st = STROKE; STROKE = [];
@@ -558,7 +617,9 @@ document.addEventListener("keydown", e => {
   if (k === "n" && STEP === "trace") { nextUncertain(); return; }
   if (STEP === "trace" && CUR && /^[1-3]$/.test(k)) { const ch = CUR.choices[+k - 1]; if (ch) answer(ch.id); return; }
   if (STEP === "trace" && CUR && k === "k") { answer("skip"); return; }
-  if (k === "escape") setMode("pan"); else if (k === "z" && !e.metaKey && !e.ctrlKey) undo(); else if (b && !b.disabled) b.click();
+  if (k === "escape") { RECT_CUR_LINE = null; RECT_EDGE_PT = null; RECT_DRAG = null; setMode("pan"); }
+  else if (k === "z" && !e.metaKey && !e.ctrlKey) undo();
+  else if (b && !b.disabled) b.click();
   else if ((k === "delete" || k === "backspace") && STEP === "tracks") delLabels();
 });
 async function undo() { if (!SID || !ST?.undo.length) return; const r = await api("POST", A("/undo")); toast("undone: " + r.undone);
@@ -731,7 +792,8 @@ R.tracks = async () => {
     <div class="row"><label>move left</label><input type="number" id="eL" value="0" step="1" style="width:5em"><label style="min-width:0">right</label><input type="number" id="eR" value="0" step="1" style="width:5em"><button id="eApply">Move</button></div>
     <div class="row">${tool("box", "b", "Draw box")}<span class="note">no track found? click two corners of the curve's track</span></div>
     ${KEYS("<b>L</b> add a depth label · <kbd>Delete</kbd> removes selected rows", "Moving a border re-traces every curve in that track", "Applying depths re-traces every curve; <kbd>Z</kbd> undoes", NAV)}`;
-  rectInitFromSession(); renderRectPanel();
+  rectInitFromSession();
+  renderRectPanel();
   renderLabels();
   if (ST.residuals?.length) fig(chart({title: "Depth anchors: leave-one-out residuals", series: [{pts: ST.residuals, color: TAB10[0], dots: true, r: 2.5, alpha: 1}], xlabel: "depth (ft)", ylabel: "LOO residual (ft)", w: 350, h: 170}), true);
   on("lDel", delLabels);
